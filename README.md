@@ -96,7 +96,8 @@ Stop Funnel:
 ```bash
 sudo tailscale funnel off
 ```
-<img width="1085" height="497" alt="image" src="https://github.com/user-attachments/assets/f15c1f53-b2a3-4555-b2e4-c613fae85b47" />
+<img width="1085" height="497" alt="image" src="https://github.com/user-attachments/assets/bd342f97-2a22-4824-a747-293189a9e907" />
+
 
 ## Logging
 
