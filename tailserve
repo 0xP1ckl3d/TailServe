@@ -1,0 +1,1528 @@
+#!/usr/bin/env python3
+"""
+TailServe - Professional PHP Development Server
+A feature-rich wrapper around PHP's built-in server for rapid deployment.
+"""
+
+import argparse
+import re
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+
+# Version information
+__version__ = "1.0.0"
+__author__ = "0xP1ckl3d"
+
+# ------- Enhanced formatting and utilities -------
+CLR = {
+    "red": "\x1b[31m",
+    "green": "\x1b[32m", 
+    "yellow": "\x1b[33m",
+    "blue": "\x1b[34m",
+    "magenta": "\x1b[35m",
+    "cyan": "\x1b[36m",
+    "white": "\x1b[37m",
+    "dim": "\x1b[2m",
+    "bold": "\x1b[1m",
+    "reset": "\x1b[0m"
+}
+
+CLR.update({"info": CLR["white"], "warning": CLR["yellow"], "error": CLR["red"], "debug": CLR["cyan"]})
+
+def ts():
+    """Generate timestamp string"""
+    return time.strftime("[%a %b %d %H:%M:%S %Y]")
+
+def colour_ok(mode):
+    """Determine if color output should be used"""
+    return True if mode == "always" else False if mode == "never" else sys.stderr.isatty()
+
+def load_config(config_path):
+    """Load configuration from JSON file"""
+    try:
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load config {config_path}: {e}", file=sys.stderr)
+        return {}
+
+
+
+# ------- Enhanced PHP router with security hardening -------
+ROUTER_TPL = r"""<?php
+// Initialize upload limits from environment and add safe defaults
+$maxUpload = getenv('tailserve_MAX_UPLOAD') ?: '1G';
+$uploadTimeout = intval(getenv('tailserve_UPLOAD_TIMEOUT') ?: '600'); // seconds
+
+ini_set('upload_max_filesize', $maxUpload);
+ini_set('post_max_size', $maxUpload);
+ini_set('max_file_uploads', '200');
+ini_set('max_input_time', (string)$uploadTimeout);
+ini_set('memory_limit', '1G'); // script memory; upload temp files go to system tmp
+ini_set('max_execution_time', (string)max(120, $uploadTimeout + 30)); // allow time to move files
+
+// Early guard: reject bodies larger than limit with a clear 413
+function parse_size($val) {
+    $val = trim($val);
+    if ($val === '' || $val === '0') return 0; // 0 means unlimited
+    $unit = strtolower(substr($val, -1));
+    $num  = (float)$val;
+    switch ($unit) {
+        case 'g': return (int)($num * 1024 * 1024 * 1024);
+        case 'm': return (int)($num * 1024 * 1024);
+        case 'k': return (int)($num * 1024);
+        default:  return (int)$num;
+    }
+}
+
+$__limitBytes = parse_size($maxUpload);
+
+if ($__limitBytes > 0 && !empty($_SERVER['CONTENT_LENGTH']) && (int)$_SERVER['CONTENT_LENGTH'] > $__limitBytes) {
+    http_response_code(413);
+    header('Content-Type: application/json');
+    echo json_encode(['error' => 'Payload too large', 'limit' => $maxUpload]);
+    exit;
+}
+
+function ts(){ return strftime("[%a %b %d %H:%M:%S %Y]"); }
+
+function sanitize_for_log($str, $max_len = 100) {
+    if (!$str) return '';
+    $clean = preg_replace('/[^\w\s\-_.\/()\[\]:,;]/', '', substr($str, 0, $max_len));
+    return trim($clean);
+}
+
+function check_auth() {
+    $auth_required = getenv('tailserve_AUTH_USER') && getenv('tailserve_AUTH_PASS');
+    
+    if (!$auth_required) {
+        return true;
+    }
+    
+    $user = getenv('tailserve_AUTH_USER');
+    $pass = getenv('tailserve_AUTH_PASS');
+    
+    if (empty($_SERVER['HTTP_AUTHORIZATION'])) {
+        http_response_code(401);
+        header('WWW-Authenticate: Basic realm="PHP Development Server"');
+        echo '<!DOCTYPE html><title>401 Unauthorized</title><h1>401 Unauthorized</h1><p>Authentication required.</p>';
+        return false;
+    }
+    
+    $auth = $_SERVER['HTTP_AUTHORIZATION'];
+    if (strpos($auth, 'Basic ') !== 0) {
+        http_response_code(401);
+        header('WWW-Authenticate: Basic realm="PHP Development Server"');
+        echo '<!DOCTYPE html><title>401 Unauthorized</title><h1>401 Unauthorized</h1><p>Invalid authentication method.</p>';
+        return false;
+    }
+    
+    $credentials = base64_decode(substr($auth, 6));
+    list($provided_user, $provided_pass) = explode(':', $credentials, 2);
+    
+    if ($provided_user !== $user || $provided_pass !== $pass) {
+        http_response_code(401);
+        header('WWW-Authenticate: Basic realm="PHP Development Server"');
+        echo '<!DOCTYPE html><title>401 Unauthorized</title><h1>401 Unauthorized</h1><p>Invalid credentials.</p>';
+        return false;
+    }
+    
+    return true;
+}
+
+function log_request($code, $start_time = null) {
+    $ip     = $_SERVER['REMOTE_ADDR'] ?? '-';
+    $method = $_SERVER['REQUEST_METHOD'] ?? '-';
+    $uri    = $_SERVER['REQUEST_URI'] ?? '-';
+    $ua     = $_SERVER['HTTP_USER_AGENT'] ?? null;
+    $xff    = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? null;
+    $size   = null;
+    $duration = null;
+    
+    // Sanitize inputs for logging
+    $uri = sanitize_for_log($uri, 200);
+    $method = preg_replace('/[^A-Z]/', '', strtoupper(substr($method, 0, 10)));
+    
+    if ($start_time) {
+        $duration = (microtime(true) - $start_time) * 1000;
+    }
+    
+    if (function_exists('fastcgi_finish_request')) {
+        $size = ob_get_length();
+    }
+
+    $pfx = "$ip [$method] $uri";
+    $status = "[$code]";
+    
+    if (getenv('tailserve_COLOUR') === '1') {
+        $pfx = "\x1b[36m" . $pfx . "\x1b[0m";
+        $color = $code >= 400 ? "\x1b[31m" : ($code >= 300 ? "\x1b[33m" : "\x1b[32m");
+        $status = $color . $status . "\x1b[0m";
+    }
+    
+    $meta = [];
+    if ($xff) {
+        $xff_clean = preg_replace('/[^\d.,\s]/', '', substr($xff, 0, 50));
+        if (trim($xff_clean)) {
+            $val = trim($xff_clean);
+            if (getenv('tailserve_COLOUR') === '1') {
+                $meta[] = "XFF=\x1b[35m" . $val . "\x1b[0m";
+            } else {
+                $meta[] = "XFF=" . $val;
+            }
+        }
+    }
+    if ($ua) {
+        $ua_clean = sanitize_for_log($ua, 80);
+        if ($ua_clean) {
+            $meta[] = 'UA="' . $ua_clean . '"';
+        }
+    }
+    if ($size !== null && is_numeric($size) && $size >= 0) {
+        $meta[] = "size=" . intval($size) . "b";
+    }
+    if ($duration !== null && is_numeric($duration) && $duration >= 0) {
+        $meta[] = sprintf("time=%.2fms", $duration);
+    }
+    
+    $tail = "";
+    if ($meta) {
+        $tail = " [" . implode(" ", $meta) . "]";
+        if (getenv('tailserve_COLOUR') === '1') {
+            $tail = " \x1b[2m" . $tail . "\x1b[0m";
+        }
+    }
+    
+    error_log(ts() . " " . $pfx . " " . $status . $tail);
+}
+
+function send_security_headers() {
+    if (getenv('tailserve_SECURITY_HEADERS') === '1') {
+        header('X-Content-Type-Options: nosniff');
+        header('X-Frame-Options: DENY');
+        header('X-XSS-Protection: 1; mode=block');
+        header('Referrer-Policy: strict-origin-when-cross-origin');
+        header('Content-Security-Policy: default-src \'self\'; script-src \'self\' \'unsafe-inline\'; style-src \'self\' \'unsafe-inline\'');
+        // Prevent information disclosure in development
+        if (function_exists('header_remove')) {
+            header_remove('X-Powered-By');
+            header_remove('Server');
+        }
+    }
+}
+
+function send_cors_headers() {
+    if (getenv('tailserve_CORS') === '1') {
+        // More restrictive CORS for development
+        $allowed_origins = explode(',', getenv('tailserve_CORS_ORIGINS') ?: 'http://localhost:3000,http://127.0.0.1:3000');
+        $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+        
+        if (in_array($origin, $allowed_origins, true)) {
+            header("Access-Control-Allow-Origin: $origin");
+        } else {
+            header('Access-Control-Allow-Origin: null');
+        }
+        
+        header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, PATCH');
+        header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
+        header('Access-Control-Allow-Credentials: true');
+        header('Access-Control-Max-Age: 86400');
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+            http_response_code(200);
+            log_request(200, microtime(true));
+            exit;
+        }
+    }
+}
+
+function serve_directory_listing($doc_root, $current_path, $real_path) {
+    $relative_path = str_replace($doc_root, '', $real_path);
+    $relative_path = trim($relative_path, '/');
+    $display_path = $relative_path ? '/' . $relative_path : '/';
+    
+    // Security: Ensure we're still within docroot
+    if (!str_starts_with($real_path, realpath($doc_root))) {
+        http_response_code(403);
+        echo "<!doctype html><title>403 Forbidden</title><h1>403 Forbidden</h1>";
+        return;
+    }
+    
+    if (!is_dir($real_path)) {
+        http_response_code(404);
+        serve_404();
+        return;
+    }
+    
+    header('Content-Type: text/html; charset=UTF-8');
+    
+    $items = [];
+    $files = scandir($real_path);
+    
+    foreach ($files as $file) {
+        if ($file === '.') continue;
+        if ($file === '..' && $relative_path === '') continue;
+        
+        $item_path = $real_path . '/' . $file;
+        $is_dir = is_dir($item_path);
+        $size = $is_dir ? '-' : number_format(filesize($item_path));
+        $modified = date('Y-m-d H:i:s', filemtime($item_path));
+        
+        $items[] = [
+            'name' => $file,
+            'is_dir' => $is_dir,
+            'size' => $size,
+            'modified' => $modified,
+            'is_parent' => $file === '..'
+        ];
+    }
+    
+    // Sort: directories first, then files, with .. always at top
+    usort($items, function($a, $b) {
+        if ($a['is_parent']) return -1;
+        if ($b['is_parent']) return 1;
+        if ($a['is_dir'] !== $b['is_dir']) return $b['is_dir'] - $a['is_dir'];
+        return strcasecmp($a['name'], $b['name']);
+    });
+    
+    echo '<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/png" href="/favicon.ico">
+    <title>Directory: ' . htmlspecialchars($display_path) . '</title>
+    <style>
+    :root{
+        --bg:#0b0f14; --card:#111823; --elev:#0f1722; --text:#e6edf3; --muted:#9fb3c8; --border:#1f2a37;
+        --accent:#22c55e; --accent-2:#16a34a; --warning:#f59e0b; --danger:#ef4444; --shadow:0 10px 30px rgba(0,0,0,.35);
+    }
+    [data-theme="light"]{
+        --bg:#f6f7f9; --card:#ffffff; --elev:#ffffff; --text:#111827; --muted:#4b5563; --border:#e5e7eb;
+        --accent:#16a34a; --accent-2:#15803d; --warning:#b45309; --danger:#b91c1c; --shadow:0 6px 18px rgba(0,0,0,.08);
+    }
+    *{box-sizing:border-box} html,body{height:100%}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;background:var(--bg);color:var(--text);transition:background .25s,color .25s}
+    .toggle{position:fixed;top:14px;right:14px;z-index:20;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:.5rem .9rem;cursor:pointer;font-weight:600;box-shadow:var(--shadow)}
+    .toggle:hover{background:var(--elev)}
+    .header{position:sticky;top:0;z-index:10;background:linear-gradient(135deg,#0b3b23 0%,#0a2a4a 100%);padding:2rem 2rem 1.5rem;box-shadow:var(--shadow);border-bottom:1px solid var(--border)}
+    [data-theme="light"] .header{background:linear-gradient(135deg,#dff7e8 0%,#e6f0ff 100%)}
+    h1{margin:0 0 .5rem;font-size:1.6rem}.sub{opacity:.8}
+    .container{max-width:1200px;margin:1.5rem auto;padding:0 2rem}
+    .upload-section{background:var(--card);border:1px dashed var(--border);border-radius:12px;padding:1.25rem;margin-bottom:1.5rem;box-shadow:var(--shadow)}
+    .upload-section h2{margin:0 0 .75rem;color:var(--accent)}
+    .file-input{width:100%;padding:1rem;border:1px solid var(--border);border-radius:8px;background:var(--elev);color:var(--text)}
+    .upload-btn{background:var(--accent);color:#fff;border:none;padding:.8rem 1.25rem;border-radius:8px;font-weight:600;cursor:pointer;margin-top:.75rem}
+    .upload-btn:hover{background:var(--accent-2)} .upload-btn:disabled{opacity:.6;cursor:not-allowed}
+    .progress-bar{width:100%;height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:1rem;display:none}
+    .progress-fill{height:100%;background:var(--accent);width:0%}
+    .message{display:none;margin-top:1rem;padding:1rem;border-radius:8px;border:1px solid var(--border)}
+    .message.success{background:rgba(34,197,94,.12);color:#22c55e}.message.error{background:rgba(239,68,68,.12);color:#ef4444}
+    .file-list{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:var(--shadow)}
+    .file-list-header{background:rgba(255,255,255,.03);padding:1rem 1.25rem;font-weight:700;display:grid;grid-template-columns:1fr auto auto auto;gap:1rem;border-bottom:1px solid var(--border)}
+    .file-item{padding:1rem 1.25rem;border-bottom:1px solid var(--border);display:grid;grid-template-columns:1fr auto auto auto;gap:1rem;align-items:center}
+    .file-item:hover{background:rgba(255,255,255,.03)} .file-item:last-child{border-bottom:none}
+    .file-name{display:flex;align-items:center;gap:.6rem} .file-name a{color:var(--text);text-decoration:none} .file-name a:hover{color:var(--accent)}
+    .file-size,.file-date{color:var(--muted);font-size:.9rem}
+    .file-actions{display:flex;gap:.5rem}
+    .action-btn{padding:.45rem .55rem;border:none;border-radius:6px;cursor:pointer;font-size:.85rem}
+    .download-btn{background:rgba(34,197,94,.15);color:var(--accent)} .download-btn:hover{background:rgba(34,197,94,.25)}
+    .delete-btn{background:rgba(239,68,68,.12);color:#ef4444} .delete-btn:hover{background:rgba(239,68,68,.2)}
+    .brand{display:flex;align-items:center;gap:1.25rem}
+    .logo{height:140px;width:auto;display:block;border-radius:10px}
+    @media (max-width:768px){.file-list-header,.file-item{grid-template-columns:1fr auto;gap:.5rem}.file-size,.file-date{display:none}}
+    </style>
+</head>
+<body>
+    <button class="toggle" id="themeToggle" aria-label="Toggle theme">🌙 Dark</button>
+    <div class="header">
+    <div class="brand">
+        <img class="logo" src="/_tailserve/logo.png" alt="TailServe logo" loading="lazy">
+        <h1>📁 Directory Browser</h1>
+    </div>
+    <p>Current Path: ' . htmlspecialchars($display_path) . '</p>
+    </div>
+    
+    <div class="container">
+        <div class="upload-section">
+            <h2>📤 Upload Files</h2>
+            <form id="uploadForm" enctype="multipart/form-data">
+                <input type="file" name="files[]" multiple class="file-input" id="fileInput">
+                <button type="submit" class="upload-btn" id="uploadBtn">Upload Files</button>
+                <div class="progress-bar" id="progressBar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+            </form>
+            <div class="message" id="message"></div>
+        </div>
+        
+        <div class="file-list">
+            <div class="file-list-header">
+                <div>Name</div>
+                <div>Size</div>
+                <div>Modified</div>
+                <div>Actions</div>
+            </div>';
+    
+    foreach ($items as $item) {
+        $icon = $item['is_dir'] ? '📁' : '📄';
+        
+        // Fix the parent directory link
+        if ($item['is_parent']) {
+            // Calculate parent path correctly
+            $parent_path = dirname($current_path);
+            if ($parent_path === '.' || $parent_path === '') {
+                $href = '/';
+            } else {
+                $href = $parent_path;
+            }
+            // Ensure proper trailing slash for parent directories
+            if ($href !== '/' && substr($href, -1) !== '/') {
+                $href .= '/';
+            }
+        } else {
+            $href = $current_path . ($current_path === '/' ? '' : '/') . $item['name'];
+            if ($item['is_dir']) {
+                $href .= '/';
+            }
+        }
+        
+        echo '<div class="file-item">
+            <div class="file-name">
+                <span class="file-icon">' . $icon . '</span>
+                <a href="' . htmlspecialchars($href) . '">' . htmlspecialchars($item['name']) . '</a>
+            </div>
+            <div class="file-size">' . htmlspecialchars($item['size']) . '</div>
+            <div class="file-date">' . htmlspecialchars($item['modified']) . '</div>
+            <div class="file-actions">';
+        
+        if (!$item['is_dir'] && !$item['is_parent']) {
+            echo '<button class="action-btn download-btn" onclick="downloadFile(\'' . htmlspecialchars($item['name']) . '\')">⬇️</button>';
+            echo '<button class="action-btn delete-btn" onclick="deleteFile(\'' . htmlspecialchars($item['name']) . '\')">🗑️</button>';
+        }
+        
+        echo '</div>
+        </div>';
+    }
+    
+    echo '</div>
+    </div>
+    
+    <script>
+    (function(){
+        const stored = localStorage.getItem("ts_theme");
+        const theme = stored ? stored : "dark";
+        document.documentElement.setAttribute("data-theme", theme);
+        const btn = document.getElementById("themeToggle");
+        function label(t){ btn.textContent = (t==="dark" ? "🌙 Dark" : "☀️ Light"); }
+        label(theme);
+        btn.addEventListener("click", function(){
+        const cur = document.documentElement.getAttribute("data-theme");
+        const next = (cur === "dark") ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        localStorage.setItem("ts_theme", next);
+        label(next);
+        });
+    })();
+    </script>
+
+    <script>
+        const uploadForm = document.getElementById("uploadForm");
+        const fileInput = document.getElementById("fileInput");
+        const uploadBtn = document.getElementById("uploadBtn");
+        const progressBar = document.getElementById("progressBar");
+        const progressFill = document.getElementById("progressFill");
+        const message = document.getElementById("message");
+        
+        uploadForm.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            
+            const files = fileInput.files;
+            if (files.length === 0) {
+                showMessage("Please select files to upload", "error");
+                return;
+            }
+            
+            const formData = new FormData();
+            for (let file of files) {
+                formData.append("files[]", file);
+            }
+            
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = "Uploading...";
+            progressBar.style.display = "block";
+            
+            try {
+                const response = await fetch(window.location.href + "?upload=1", {
+                    method: "POST",
+                    body: formData
+                });
+                
+                const result = await response.text();
+                
+                if (response.ok) {
+                    showMessage("Files uploaded successfully!", "success");
+                    fileInput.value = "";
+                    setTimeout(() => window.location.reload(), 1500);
+                } else {
+                    showMessage("Upload failed: " + result, "error");
+                }
+            } catch (error) {
+                showMessage("Upload error: " + error.message, "error");
+            } finally {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = "Upload Files";
+                progressBar.style.display = "none";
+                progressFill.style.width = "0%";
+            }
+        });
+        
+        function downloadFile(filename) {
+            const link = document.createElement("a");
+            link.href = filename + "?download=1";
+            link.download = filename;
+            link.click();
+        }
+        
+        function deleteFile(filename) {
+            if (confirm("Are you sure you want to delete " + filename + "?")) {
+                fetch(filename + "?delete=1", { method: "POST" })
+                    .then(response => {
+                        if (response.ok) {
+                            showMessage("File deleted successfully", "success");
+                            setTimeout(() => window.location.reload(), 1000);
+                        } else {
+                            showMessage("Failed to delete file", "error");
+                        }
+                    })
+                    .catch(error => {
+                        showMessage("Delete error: " + error.message, "error");
+                    });
+            }
+        }
+        
+        function showMessage(text, type) {
+            message.textContent = text;
+            message.className = "message " + type;
+            message.style.display = "block";
+            
+            setTimeout(() => {
+                message.style.display = "none";
+            }, 5000);
+        }
+    </script>
+</body>
+</html>';
+}
+
+function serve_404($custom_404 = null) {
+    http_response_code(404);
+    header('Content-Type: text/html; charset=UTF-8');
+    
+    if ($custom_404 && is_file($custom_404)) {
+        $content = file_get_contents($custom_404);
+        // Secure template variable replacement - only allow safe variables
+        $safe_vars = [
+            '{{TIMESTAMP}}' => date('c'),
+            '{{SERVER_NAME}}' => 'Development Server'  // Don't expose real server name
+        ];
+        $content = str_replace(array_keys($safe_vars), array_values($safe_vars), $content);
+        echo $content;
+    } else {
+        // Inline default 404 page (no disk writes needed)
+        echo '<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/png" href="/favicon.ico">
+    <title>404 Not Found</title>
+    <style>
+    :root{
+        --bg:#0b0f14;--card:#111823;--text:#e6edf3;--muted:#9fb3c8;--border:#1f2a37;
+        --accent:#22c55e;--accent-2:#16a34a;--shadow:0 10px 30px rgba(0,0,0,.35)
+    }
+    [data-theme="light"]{
+        --bg:#f6f7f9;--card:#ffffff;--text:#111827;--muted:#4b5563;--border:#e5e7eb;
+        --accent:#16a34a;--accent-2:#15803d;--shadow:0 6px 18px rgba(0,0,0,.08)
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0}
+    body{
+        font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;
+        display:grid;place-items:center; /* robust centering */
+        background:var(--bg);color:var(--text);
+        transition:background .25s,color .25s;min-height:100vh;
+    }
+    .toggle{
+        position:fixed;top:14px;right:14px;z-index:20;
+        background:var(--card);color:var(--text);
+        border:1px solid var(--border);border-radius:999px;
+        padding:.5rem .9rem;cursor:pointer;font-weight:600;box-shadow:var(--shadow)
+    }
+    /* your HTML uses .container – style it (previously .wrap) */
+    .container{
+        background:var(--card);width:min(560px,92%);padding:2.25rem;border-radius:14px;
+        box-shadow:var(--shadow);text-align:center;border:1px solid var(--border)
+    }
+    h1{font-size:4rem;margin:.25rem 0;color:var(--accent)}
+    h2{margin:.25rem 0 .75rem;color:var(--muted);font-weight:500}
+    p{color:var(--muted);margin:0 0 1.25rem}
+    .btn{
+        display:inline-block;background:var(--accent);color:#fff;text-decoration:none;
+        padding:.8rem 1.25rem;border-radius:10px;font-weight:700
+    }
+    .btn:hover{background:var(--accent-2)}
+    .icon{font-size:4rem;margin-bottom:.5rem}
+    .logo404{width:240px;height:auto;margin-bottom:.9rem;border-radius:14px}
+    </style>
+
+</head>
+<body>
+    <button class="toggle" id="themeToggle" aria-label="Toggle theme">🌙 Dark</button>
+    <div class="container">
+        <img src="/_tailserve/logo.png" alt="TailServe logo" class="logo404" loading="lazy">
+        <h1>404</h1>
+        <h3>Page Not Found</h3>
+        <p>The page you\'re looking for doesn\'t exist or has been moved.</p>
+        <a href="/" class="btn">← Back to Home</a>
+    </div>
+
+    <script>
+    (function(){
+        const stored = localStorage.getItem("ts_theme");
+        const theme = stored ? stored : "dark";
+        document.documentElement.setAttribute("data-theme", theme);
+        const btn = document.getElementById("themeToggle");
+        function label(t){ btn.textContent = (t==="dark" ? "🌙 Dark" : "☀️ Light"); }
+        label(theme);
+        btn.addEventListener("click", function(){
+        const cur = document.documentElement.getAttribute("data-theme");
+        const next = (cur === "dark") ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        localStorage.setItem("ts_theme", next);
+        label(next);
+        });
+    })();
+    </script>
+
+</body>
+</html>';
+    }
+}
+
+// Performance tracking
+$start_time = microtime(true);
+
+// Check authentication first
+if (!check_auth()) {
+    log_request(401, $start_time);
+    exit;
+}
+
+// Get configuration
+$doc_root    = rtrim($_SERVER['DOCUMENT_ROOT'] ?? getcwd(), '/');
+$path        = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+$real_path   = realpath($doc_root . $path);  // Use realpath to prevent directory traversal
+$index_file  = getenv('tailserve_INDEX') ?: 'index.php';
+$mode        = getenv('tailserve_MODE') ?: 'index';
+$custom_404  = getenv('tailserve_404_PAGE');// --- Favicon (served via GitHub raw URL)
+$favicon_url = 'https://raw.githubusercontent.com/0xP1ckl3d/TailServe/main/media/TailServeLogo.ico'; // note: /main/, not /refs/heads/main
+$logo_url = 'https://raw.githubusercontent.com/0xP1ckl3d/TailServe/main/media/TailServeLogo2.png';
+
+// Serve Favicon by proxying bytes from image hosted on GitHub
+if ($path === '/favicon.ico' || $path === '/favicon.png') {
+    $ctype = str_ends_with($path, '.png') ? 'image/png' : 'image/x-icon';
+    header('Content-Type: ' . $ctype);
+    header('Cache-Control: public, max-age=604800, immutable');
+
+    $ok = false;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($favicon_url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_USERAGENT => 'tailserve-favicon-proxy',
+            CURLOPT_TIMEOUT => 6,
+            CURLOPT_CONNECTTIMEOUT => 3,
+        ]);
+        $body = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($body !== false && $code >= 200 && $code < 300) {
+            header('Content-Length: ' . strlen($body));
+            echo $body;
+            $ok = true;
+        }
+    } else {
+        // fallback if curl isn't available (requires allow_url_fopen=On)
+        $ok = @readfile($favicon_url) !== false;
+    }
+
+    if (!$ok) { http_response_code(404); }
+    log_request($ok ? 200 : 404, $start_time);
+    exit;
+}
+
+// Serve logo by proxying bytes from image hosted on GitHub
+if ($path === '/_tailserve/logo.png') {
+    header('Content-Type: image/png');
+    header('Cache-Control: public, max-age=604800, immutable');
+
+    $ok = false;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($logo_url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_USERAGENT => 'tailserve-logo-proxy',
+            CURLOPT_TIMEOUT => 6,
+            CURLOPT_CONNECTTIMEOUT => 3,
+        ]);
+        $body = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($body !== false && $code >= 200 && $code < 300) {
+            header('Content-Length: ' . strlen($body));
+            echo $body;
+            $ok = true;
+        }
+    } else {
+        $ok = @readfile($logo_url) !== false; // needs allow_url_fopen=On
+    }
+
+    if (!$ok) { http_response_code(404); }
+    log_request($ok ? 200 : 404, $start_time);
+    exit;
+}
+
+// Security: Prevent directory traversal
+if ($real_path !== false && !str_starts_with($real_path, realpath($doc_root))) {
+    // This is a directory traversal attempt
+    http_response_code(403);
+    header('Content-Type: text/html; charset=UTF-8');
+    log_request(403, $start_time);
+    echo "<!doctype html><title>403 Forbidden</title><h1>403 Forbidden</h1>";
+    exit;
+}
+
+// Send headers
+send_security_headers();
+send_cors_headers();
+
+// Rate limiting check (basic)
+if (getenv('tailserve_RATE_LIMIT')) {
+    $rate_limit = intval(getenv('tailserve_RATE_LIMIT'));
+    $client_ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    $rate_file = sys_get_temp_dir() . '/tailserve_rate_' . md5($client_ip);
+    
+    if (file_exists($rate_file)) {
+        $requests = json_decode(file_get_contents($rate_file), true) ?: [];
+        $now = time();
+        $requests = array_filter($requests, function($req) use ($now) {
+            return ($now - $req) < 60; // 1 minute window
+        });
+        
+        if (count($requests) >= $rate_limit) {
+            http_response_code(429);
+            header('Content-Type: application/json');
+            log_request(429, $start_time);
+            echo json_encode(['error' => 'Rate limit exceeded']);
+            exit;
+        }
+        
+        $requests[] = $now;
+        file_put_contents($rate_file, json_encode($requests));
+    } else {
+        file_put_contents($rate_file, json_encode([time()]));
+    }
+}
+
+// Handle file operations for directory mode
+if ($mode === 'directory') {
+    // Handle file upload
+    if (isset($_GET['upload']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_FILES['files'])) {
+            $upload_dir = $real_path && is_dir($real_path) ? $real_path : $doc_root;
+            $success_count = 0;
+            $errors = [];
+
+            foreach ($_FILES['files']['name'] as $key => $name) {
+                $err = $_FILES['files']['error'][$key];
+
+                if ($err === UPLOAD_ERR_OK) {
+                    $tmp_name = $_FILES['files']['tmp_name'][$key];
+                    // Security: Sanitize filename
+                    $safe_name = preg_replace('/[^a-zA-Z0-9._-]/', '_', basename($name));
+                    $target = $upload_dir . '/' . $safe_name;
+
+                    if (move_uploaded_file($tmp_name, $target)) {
+                        $success_count++;
+                        log_request(200, $start_time);
+                    } else {
+                        $errors[] = "Failed to upload " . $safe_name;
+                        log_request(500, $start_time);
+                    }
+                } else {
+                    $msg = "Upload error for " . basename($name);
+                    if ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE) {
+                        $msg .= " (exceeds server limit of " . htmlspecialchars($maxUpload) . ")";
+                    } elseif ($err === UPLOAD_ERR_PARTIAL) {
+                        $msg .= " (partial upload)";
+                    } elseif ($err === UPLOAD_ERR_NO_FILE) {
+                        $msg .= " (no file)";
+                    }
+                    // Set 413 if it looks like size related
+                    if ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE) {
+                        http_response_code(413);
+                    }
+                    $errors[] = $msg;
+                    log_request(400, $start_time);
+                }
+            }
+
+            if ($success_count > 0 && empty($errors)) {
+                http_response_code(200);
+                header('Content-Type: text/plain; charset=UTF-8');
+                echo "Uploaded $success_count file(s) successfully";
+            } else {
+                if (http_response_code() === 200) http_response_code(500);
+                header('Content-Type: text/plain; charset=UTF-8');
+                echo $errors ? implode(", ", $errors) : "Upload failed";
+            }
+            exit;
+        }
+    }
+
+    
+    // Handle file download
+    if (isset($_GET['download']) && $real_path && is_file($real_path)) {
+        if (str_starts_with($real_path, realpath($doc_root))) {
+            $filename = basename($real_path);
+            $size = filesize($real_path);
+            
+            header('Content-Type: application/octet-stream');
+            header('Content-Disposition: attachment; filename="' . $filename . '"');
+            header('Content-Length: ' . $size);
+            header('Cache-Control: no-cache');
+            
+            log_request(200, $start_time);
+            readfile($real_path);
+            exit;
+        } else {
+            log_request(403, $start_time);
+            http_response_code(403);
+            exit;
+        }
+    }
+    
+    // Handle file deletion
+    if (isset($_GET['delete']) && $_SERVER['REQUEST_METHOD'] === 'POST' && $real_path && is_file($real_path)) {
+        if (str_starts_with($real_path, realpath($doc_root))) {
+            if (unlink($real_path)) {
+                log_request(200, $start_time);
+                http_response_code(200);
+                echo "File deleted successfully";
+            } else {
+                log_request(500, $start_time);
+                http_response_code(500);
+                echo "Failed to delete file";
+            }
+            exit;
+        } else {
+            log_request(403, $start_time);
+            http_response_code(403);
+            exit;
+        }
+    }
+}
+
+// Restricted health check endpoint (limit info disclosure)
+if ($path === '/_tailserve/health') {
+    header('Content-Type: application/json');
+    echo json_encode([
+        'status' => 'ok',
+        'timestamp' => date('c')
+    ]);
+    log_request(200, $start_time);
+    exit;
+}
+
+// Handle static files
+if ($real_path && is_file($real_path)) {
+    // Security: Only serve files from within docroot
+    if (str_starts_with($real_path, realpath($doc_root))) {
+        // Add cache headers for static files in development
+        if (getenv('tailserve_CACHE_STATIC') === '1') {
+            $ext = strtolower(pathinfo($real_path, PATHINFO_EXTENSION));
+            $cache_time = in_array($ext, ['css', 'js', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico']) ? 3600 : 300;
+            header("Cache-Control: public, max-age=$cache_time");
+            header('ETag: "' . md5_file($real_path) . '"');
+        }
+        
+        log_request(200, $start_time);
+        return false; // Let PHP handle the file serving
+    } else {
+        // Directory traversal attempt for existing file
+        log_request(403, $start_time);
+        http_response_code(403);
+        echo "<!doctype html><title>403 Forbidden</title><h1>403 Forbidden</h1>";
+        exit;
+    }
+}
+
+// Handle different routing modes
+switch ($mode) {
+    case 'directory':
+        // Directory listing mode - serve directory browser with upload/download
+        if ($real_path && is_dir($real_path)) {
+            // Valid directory - serve directory listing
+            log_request(200, $start_time);
+            serve_directory_listing($doc_root, $path, $real_path);
+        } elseif ($real_path && is_file($real_path)) {
+            // File exists but was handled above - this shouldn't happen
+            log_request(200, $start_time);
+            return false;
+        } else {
+            // Path doesn't exist or is outside docroot - serve 404
+            log_request(404, $start_time);
+            serve_404($custom_404);
+        }
+        exit;
+        
+    case 'all404':
+        log_request(404, $start_time);
+        serve_404($custom_404);
+        exit;
+        
+    case 'spa':
+        // Single Page Application mode - serve index for all non-file requests
+        $index_path = $doc_root . '/' . $index_file;
+        if (is_file($index_path) && str_starts_with(realpath($index_path), realpath($doc_root))) {
+            log_request(200, $start_time);
+            require $index_path;
+        } else {
+            log_request(404, $start_time);
+            serve_404($custom_404);
+        }
+        exit;
+        
+    case 'api':
+        // API mode - serve JSON 404 for missing endpoints
+        http_response_code(404);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'Endpoint not found']);
+        log_request(404, $start_time);
+        exit;
+        
+    case 'index':
+    default:
+        // Traditional index.php routing
+        $index_path = $doc_root . '/' . $index_file;
+        if (is_file($index_path) && str_starts_with(realpath($index_path), realpath($doc_root))) {
+            log_request(200, $start_time);
+            require $index_path;
+        } else {
+            log_request(404, $start_time);
+            serve_404($custom_404);
+        }
+        exit;
+}
+"""
+
+class tailserveConfig:
+    """Configuration management for tailserve"""
+    
+    def __init__(self):
+        self.defaults = {
+            'port': 8000,
+            'host': '0.0.0.0',
+            'directory': '.',
+            'index': 'index.php',
+            'mode': 'index',
+            'colour': 'auto',
+            'log_file': None,
+            'custom_404': None,
+            'cors': False,
+            'rate_limit': None,
+            'quiet': False,
+            'verbose': False,
+            'cors_origins': None,
+            'bind_localhost_only': False,
+            'no_security_headers': False,
+            'no_cache_static': False,
+            'auth': None
+        }
+        
+        # Initialize all attributes from defaults
+        for key, value in self.defaults.items():
+            setattr(self, key, value)
+    
+    def load_from_file(self, config_path):
+        """Load configuration from JSON file"""
+        config = load_config(config_path)
+        for key, value in config.items():
+            if key in self.defaults:
+                setattr(self, key, value)
+
+class LogManager:
+    """Enhanced logging with file output support"""
+    
+    def __init__(self, log_file=None, use_colour=False, quiet=False, verbose=False):
+        self.log_file = log_file
+        self.use_colour = use_colour
+        self.quiet = quiet
+        self.verbose = verbose
+        self.file_handle = None
+        self._ansi_re = re.compile(r'\x1b\[[0-9;]*m')
+        
+        if self.log_file:
+            try:
+                self.file_handle = open(self.log_file, 'a', encoding='utf-8')
+            except Exception as e:
+                print(f"Warning: Could not open log file {self.log_file}: {e}", file=sys.stderr)
+    
+    def tee(self, raw_line: str):
+        """Write a pre-formatted line (e.g., from PHP router) to stderr and file unchanged (file: no ANSI)."""
+        if not self.quiet:
+            print(raw_line, file=sys.stderr)
+        if self.file_handle:
+            try:
+                self.file_handle.write(self._ansi_re.sub('', raw_line) + '\n')
+                self.file_handle.flush()
+            except Exception:
+                pass
+    
+    def log(self, message, level='INFO'):
+        """Log message to stderr and optionally to file"""
+        if self.quiet and level == 'INFO':
+            return
+        
+        timestamp = ts()
+        if level != 'INFO':
+            formatted = f"{timestamp} [{level}] {message}"
+        else:
+            formatted = f"{timestamp} {message}"
+        
+        # Console output
+        if not self.quiet or level in ['ERROR', 'WARNING']:
+            if self.use_colour:
+                color = CLR.get(level.lower(), CLR['reset'])
+                print(f"{color}{formatted}{CLR['reset']}", file=sys.stderr)
+            else:
+                print(formatted, file=sys.stderr)
+        
+        # File output (always without color)
+        if self.file_handle:
+            try:
+                self.file_handle.write(formatted + '\n')
+                self.file_handle.flush()
+            except Exception:
+                pass  # Silently handle file write errors
+    
+    def close(self):
+        if self.file_handle:
+            try:
+                self.file_handle.close()
+            except Exception:
+                pass
+
+def write_router_tmpfs():
+    """Write router to tmpfs or temporary file"""
+    shm_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+    
+    if shm_dir:
+        router_path = os.path.join(shm_dir, f"tailserve_router_{os.getpid()}.php")
+        try:
+            with open(router_path, "w", encoding="utf-8") as f:
+                f.write(ROUTER_TPL)
+            return router_path, True
+        except Exception:
+            pass  # Fall through to temp file
+    
+    # Fallback to temporary file
+    tmp = tempfile.NamedTemporaryFile(prefix="tailserve_router_", suffix=".php", delete=False)
+    tmp.write(ROUTER_TPL.encode("utf-8"))
+    tmp.flush()
+    tmp.close()
+    return tmp.name, False
+
+def check_php_version():
+    """Check if PHP is available and get version info"""
+    try:
+        result = subprocess.run(['php', '--version'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            version_line = result.stdout.split('\n')[0]
+            return True, version_line
+    except Exception:
+        pass
+    return False, None
+
+def validate_path_security(path, base_dir):
+    """Validate that a path is within the base directory (prevent directory traversal)"""
+    try:
+        abs_path = os.path.abspath(path)
+        abs_base = os.path.abspath(base_dir)
+        return abs_path.startswith(abs_base)
+    except Exception:
+        return False
+
+def validate_custom_404(docroot, custom_404_path=None):
+    """Validate custom 404 page path (no disk writes)"""
+    if custom_404_path:
+        # Security: Ensure custom 404 path is within safe boundaries
+        abs_custom = os.path.abspath(custom_404_path)
+        if os.path.isfile(abs_custom) and validate_path_security(abs_custom, docroot):
+            return abs_custom
+        else:
+            print(f"Warning: Custom 404 page not found or outside docroot: {custom_404_path}", file=sys.stderr)
+    
+    return None
+
+def main():
+    """Main application entry point"""
+    ap = argparse.ArgumentParser(
+        prog="tailserve",
+        description=f"Professional PHP Development Server v{__version__}\n\nA feature-rich wrapper around PHP's built-in server for rapid development.",
+        epilog="""Examples:
+  %(prog)s                           Start server on port 8000
+  %(prog)s -p 3000                   Start server on port 3000  
+  %(prog)s -d /var/www               Serve from /var/www directory
+  %(prog)s -m directory              Enable directory browser with file upload
+  %(prog)s --auth "admin:secret"     Enable basic authentication
+  %(prog)s --cors --rate-limit 100   Enable CORS with rate limiting
+  %(prog)s -c config.json            Load settings from config file
+
+For more information, visit: https://github.com/0xP1ckl3d/tailserve""",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Server options
+    server_group = ap.add_argument_group('Server Configuration')
+    server_group.add_argument("-p", "--port", type=int, default=8000, metavar="PORT",
+                             help="Server port (default: 8000)")
+    server_group.add_argument("-H", "--host", default="0.0.0.0", metavar="HOST",
+                             help="Host to bind to (default: 0.0.0.0)")
+    server_group.add_argument("-d", "--directory", default=os.getcwd(), metavar="DIR",
+                             help="Document root directory (default: current)")
+    server_group.add_argument("-i", "--index", default="index.php", metavar="FILE",
+                             help="Index file name (default: index.php)")
+    
+    # Routing options
+    routing_group = ap.add_argument_group('Routing & Content')
+    routing_group.add_argument("-m", "--mode", choices=["index", "spa", "api", "all404", "directory"], 
+                              default="index", metavar="MODE",
+                              help="Routing mode: index (default), spa, api, all404, directory")
+    routing_group.add_argument("--custom-404", metavar="PATH",
+                              help="Path to custom 404 page template")
+    routing_group.add_argument("-D", "--serve-directory", action="store_true",
+                              help="Enable directory listing with file management (sets mode=directory)")
+    
+    # Authentication & Security
+    security_group = ap.add_argument_group('Authentication & Security')
+    security_group.add_argument("-a", "--auth", metavar="USER:PASS",
+                               help="Enable basic authentication (format: 'username:password')")
+    security_group.add_argument("--no-security-headers", action="store_true",
+                               help="Disable security headers (X-Frame-Options, CSP, etc.)")
+    security_group.add_argument("--bind-localhost-only", action="store_true",
+                               help="Bind to 127.0.0.1 instead of 0.0.0.0 for security")
+    security_group.add_argument("-r", "--rate-limit", type=int, metavar="N",
+                               help="Rate limit: max N requests per minute per IP")
+    
+    # CORS options
+    cors_group = ap.add_argument_group('CORS Configuration')
+    cors_group.add_argument("-C", "--cors", action="store_true",
+                           help="Enable CORS headers")
+    cors_group.add_argument("--cors-origins", metavar="ORIGINS",
+                           help="Comma-separated list of allowed CORS origins")
+    
+    # Logging options
+    log_group = ap.add_argument_group('Logging & Output')
+    log_group.add_argument("--colour", choices=["auto", "always", "never"], default="auto",
+                          help="Colored output (default: auto)")
+    log_group.add_argument("-l", "--log-file", metavar="PATH",
+                          help="Log to file in addition to stderr")
+    log_group.add_argument("-q", "--quiet", action="store_true", 
+                          help="Reduce output verbosity")
+    log_group.add_argument("-v", "--verbose", action="store_true",
+                          help="Increase output verbosity")
+    
+    # Advanced options
+    advanced_group = ap.add_argument_group('Advanced Options')
+    advanced_group.add_argument("-c", "--config", metavar="PATH",
+                                help="Load configuration from JSON file")
+    advanced_group.add_argument("--no-cache-static", action="store_true",
+                                help="Disable static file caching")
+    advanced_group.add_argument("--max-upload", default="1G",
+                                help="Maximum upload size per request (e.g. 200M, 2G). Default: 1G")
+    advanced_group.add_argument("--upload-timeout", type=int, default=600,
+                                help="Max seconds to read request body (PHP max_input_time). Default: 600")
+    advanced_group.add_argument("--version", action="version", version=f"tailserve {__version__}")
+    advanced_group.add_argument("-f", "--funnel", action="store_true",
+                                help="Expose this server via Tailscale Funnel (runs in background)")
+    
+    args = ap.parse_args()
+    
+    # Security validation
+    if args.port < 1024 and os.geteuid() != 0:
+        print("Warning: Ports below 1024 usually require root privileges", file=sys.stderr)
+    
+    if args.port < 1 or args.port > 65535:
+        print("Error: Port must be between 1 and 65535", file=sys.stderr)
+        sys.exit(1)
+    
+    # Validate auth parameter
+    auth_user = None
+    auth_pass = None
+    if args.auth:
+        if ':' not in args.auth:
+            print("Error: Auth parameter must be in format 'username:password'", file=sys.stderr)
+            sys.exit(1)
+        auth_user, auth_pass = args.auth.split(':', 1)
+        if not auth_user or not auth_pass:
+            print("Error: Both username and password are required for auth", file=sys.stderr)
+            sys.exit(1)
+    
+    # Load configuration file if specified
+    config = tailserveConfig()
+    if args.config:
+        config.load_from_file(args.config)
+    
+    # Override config with command line arguments
+    for key, value in vars(args).items():
+        if value is not None:
+            setattr(config, key, value)
+    
+    # Security: Override host binding if requested
+    if args.bind_localhost_only:
+        config.host = "127.0.0.1"
+    
+    # Override mode if --serve-directory is used
+    if args.serve_directory:
+        config.mode = "directory"
+    
+    # Validate PHP availability
+    php_available, php_version = check_php_version()
+    if not php_available:
+        print("Error: PHP not found. Please install PHP CLI.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Setup logging first
+    use_colour = colour_ok(config.colour)
+    logger = LogManager(config.log_file, use_colour, config.quiet, config.verbose)
+    
+    funnel_proc = None
+    _funnel_buf = []
+    _funnel_ready = threading.Event()
+
+    def _start_funnel(port: int):
+        """Start Tailscale Funnel in background and capture output."""
+        # Inherit stdin so sudo can prompt interactively. Capture stdout for banner lines.
+        cmd = ["sudo", "tailscale", "funnel", "--bg", f"localhost:{port}"]
+        try:
+            p = subprocess.Popen(
+                cmd,
+                stdin=None,                      # inherit TTY for sudo prompt
+                stdout=subprocess.PIPE,          # capture banner
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception as e:
+            logger.log(f"Funnel start failed: {e}", 'ERROR')
+            return None
+
+        def _pump():
+            for line in p.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                if _funnel_ready.is_set():
+                    print(line, file=sys.stderr)
+                else:
+                    _funnel_buf.append(line)
+
+        t = threading.Thread(target=_pump, daemon=True)
+        t.start()
+        return p
+
+    def _stop_funnel():
+        """Disable any Funnel we started."""
+        try:
+            subprocess.run(["sudo", "tailscale", "funnel", "off"],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            try:
+                subprocess.run(["sudo", "tailscale", "funnel", "reset"],
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
+
+    
+    # Setup paths with security validation
+    try:
+        docroot = os.path.abspath(config.directory)
+        # Ensure docroot exists and is accessible
+        if not os.path.isdir(docroot):
+            logger.log(f"Error: Directory does not exist: {docroot}", 'ERROR')
+            sys.exit(1)
+        
+        # Security check: Warn if serving from sensitive directories
+        sensitive_dirs = ['/etc', '/usr', '/bin', '/sbin', '/root', '/home']
+        if any(docroot.startswith(d) for d in sensitive_dirs):
+            logger.log(f"WARNING: Serving from potentially sensitive directory: {docroot}", 'WARNING')
+            
+    except Exception as e:
+        logger.log(f"Error: Invalid directory path: {e}", 'ERROR')
+        sys.exit(1)
+    
+    index_path = os.path.join(docroot, config.index)
+    have_index = os.path.isfile(index_path)
+    
+    # Security: Validate index file is within docroot
+    if have_index and not validate_path_security(index_path, docroot):
+        logger.log(f"Error: Index file outside docroot: {config.index}", 'ERROR')
+        sys.exit(1)
+    
+    # Create or validate custom 404 page (no disk writes)
+    custom_404_path = validate_custom_404(docroot, config.custom_404)
+    
+    # Setup environment
+    env = os.environ.copy()
+    env["tailserve_COLOUR"] = "1" if use_colour else "0"
+    env["tailserve_INDEX"] = config.index
+
+    # Routing mode
+    if config.mode == "directory":
+        env["tailserve_MODE"] = "directory"
+    elif have_index or config.mode in ['all404', 'api', 'spa']:
+        env["tailserve_MODE"] = config.mode
+    else:
+        env["tailserve_MODE"] = 'all404'
+
+    env["tailserve_VERSION"] = __version__
+    env["tailserve_CORS"] = "1" if config.cors else "0"
+    env["tailserve_SECURITY_HEADERS"] = "0" if config.no_security_headers else "1"
+    env["tailserve_CACHE_STATIC"] = "0" if config.no_cache_static else "1"
+
+    # Upload tuning
+    env["tailserve_MAX_UPLOAD"] = getattr(config, "max_upload", "1G")
+    env["tailserve_UPLOAD_TIMEOUT"] = str(getattr(config, "upload_timeout", 600))
+
+    # Auth
+    if auth_user and auth_pass:
+        env["tailserve_AUTH_USER"] = auth_user
+        env["tailserve_AUTH_PASS"] = auth_pass
+
+    # Custom 404
+    if custom_404_path:
+        env["tailserve_404_PAGE"] = custom_404_path
+
+    # Optional features
+    if getattr(config, 'rate_limit', None):
+        env["tailserve_RATE_LIMIT"] = str(config.rate_limit)
+    if getattr(config, 'cors_origins', None):
+        env["tailserve_CORS_ORIGINS"] = config.cors_origins
+
+    
+    # Set auth environment variables
+    if auth_user and auth_pass:
+        env["tailserve_AUTH_USER"] = auth_user
+        env["tailserve_AUTH_PASS"] = auth_pass
+    
+    if custom_404_path:
+        env["tailserve_404_PAGE"] = custom_404_path
+    
+    if hasattr(config, 'rate_limit') and config.rate_limit:
+        env["tailserve_RATE_LIMIT"] = str(config.rate_limit)
+    
+    if hasattr(config, 'cors_origins') and config.cors_origins:
+        env["tailserve_CORS_ORIGINS"] = config.cors_origins
+    
+    # Create router
+    router_path = None
+    tmpfs_used = False
+    try:
+        router_path, tmpfs_used = write_router_tmpfs()
+    except Exception as e:
+        logger.log(f"Router creation failed: {e}", 'ERROR')
+        sys.exit(1)
+    
+    # Print startup information
+    logger.log(f"[tailserve v{__version__}] Starting PHP development server")
+    logger.log(f"PHP Version: {php_version}")
+    logger.log(f"Document Root: {docroot}")
+    logger.log(f"Index File: {config.index} {'(found)' if have_index else '(not found)'}")
+    logger.log(f"Routing Mode: {env['tailserve_MODE']}")
+    logger.log(f"Custom 404: {'Yes' if custom_404_path else 'No'}")
+    logger.log(f"Server Address: http://{config.host}:{config.port}")
+    logger.log(f"Health Check: http://{config.host}:{config.port}/_tailserve/health")
+    logger.log(f"Router: {'tmpfs' if tmpfs_used else 'temp'} ({router_path})")
+    
+    if auth_user:
+        logger.log(f"Authentication: Enabled (user: {auth_user})")
+    if config.cors:
+        logger.log("CORS headers enabled")
+    if not config.no_security_headers:
+        logger.log("Security headers enabled")
+    if config.log_file:
+        logger.log(f"Logging to file: {config.log_file}")
+    
+    if not have_index and config.mode not in ['all404', 'api', 'directory']:
+        logger.log("Warning: No index file found - all requests will return 404", 'WARNING')
+        
+    if getattr(config, "funnel", False):
+        logger.log("Starting Tailscale Funnel (background)...")
+        funnel_proc = _start_funnel(config.port)
+
+    # Start PHP server — set upload limits at SAPI startup (ini_set is too late)
+    max_up = getattr(config, "max_upload", "1G")
+    max_in_time = int(getattr(config, "upload_timeout", 600))
+    max_exec = max(120, max_in_time + 30)
+
+    cmd = [
+        "php",
+        "-d", f"upload_max_filesize={max_up}",
+        "-d", f"post_max_size={max_up}",
+        "-d", "max_file_uploads=200",
+        "-d", f"max_input_time={max_in_time}",
+        "-d", f"max_execution_time={max_exec}",
+        "-d", "memory_limit=1G",
+        "-S", f"{config.host}:{config.port}",
+        "-t", docroot,
+        router_path,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=docroot,
+            env=env,
+        )
+    except Exception as e:
+        logger.log(f"Failed to start PHP server: {e}", 'ERROR')
+        sys.exit(1)
+
+    
+    # Filter PHP server output
+    def pump_logs():
+        """Filter and process PHP server stderr output"""
+        verbs = (" GET ", " POST ", " PUT ", " DELETE ", " PATCH ", " HEAD ", " OPTIONS ")
+        
+        for line in proc.stderr:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Filter out PHP server noise
+            if any(phrase in line for phrase in [" Accepted", " Closing", "Development Server", "Document root is", "Press Ctrl-C"]):
+                continue
+            
+            # Filter out basic PHP access logs (we have better ones from router)
+            if "]: " in line and any(v in line for v in verbs) and "]: [" not in line:
+                if config.verbose:
+                    logger.log(f"[PHP] {line}", 'DEBUG')
+                continue
+            
+            # Pass through our enhanced logs and errors
+            if line.startswith('['):
+                logger.tee(line)
+            elif "Fatal error" in line or "Parse error" in line or "Warning:" in line:
+                logger.log(f"[PHP Error] {line}", 'ERROR')
+            elif config.verbose:
+                logger.log(f"[PHP] {line}", 'DEBUG')
+    
+    log_thread = threading.Thread(target=pump_logs, daemon=True)
+    log_thread.start()
+
+    # After server banner begins, flush any buffered Funnel banner and stream future lines live
+    if funnel_proc:
+        _funnel_ready.set()
+        if _funnel_buf:
+            print("Available on the internet:", file=sys.stderr)
+            for ln in _funnel_buf:
+                print(ln, file=sys.stderr)
+            _funnel_buf.clear()
+    
+    # Shutdown handling
+    shutting_down = False
+    
+    def shutdown_handler(sig=None, frame=None):
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
+        
+        logger.log("Shutting down gracefully...")
+        
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.log("Force killing PHP server", 'WARNING')
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        
+        # Cleanup router file
+        if router_path and os.path.exists(router_path):
+            try:
+                os.remove(router_path)
+            except Exception as e:
+                logger.log(f"Could not remove router file: {e}", 'WARNING')
+                
+        if funnel_proc:
+            logger.log("Disabling Tailscale Funnel...")
+            _stop_funnel()
+        
+        logger.close()
+        sys.exit(0)
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    
+    try:
+        # Wait for PHP server to exit
+        return_code = proc.wait()
+        
+        if return_code not in (0, -15, -2):  # 0=normal, -15=SIGTERM, -2=SIGINT
+            logger.log(f"PHP server exited with code {return_code}", 'ERROR')
+        
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Ensure cleanup happens
+        if router_path and os.path.exists(router_path):
+            try:
+                os.remove(router_path)
+            except Exception:
+                pass
+        logger.close()
+
+        if funnel_proc:
+            _stop_funnel()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{ts()} [tailserve] Interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"{ts()} [tailserve] Fatal error: {e}", file=sys.stderr)
+        if '--verbose' in sys.argv:
+            traceback.print_exc()
+        sys.exit(1)
