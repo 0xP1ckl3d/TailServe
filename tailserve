@@ -924,9 +924,11 @@ switch ($mode) {
         
     case 'index':
     default:
-        // Traditional index.php routing
+        // Only serve index at the root. Non-files elsewhere 404.
         $index_path = $doc_root . '/' . $index_file;
-        if (is_file($index_path) && str_starts_with(realpath($index_path), realpath($doc_root))) {
+        if (($path === '/' || $path === '' || $path === '/index.php') &&
+            is_file($index_path) &&
+            str_starts_with(realpath($index_path), realpath($doc_root))) {
             log_request(200, $start_time);
             require $index_path;
         } else {
