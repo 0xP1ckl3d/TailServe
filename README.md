@@ -1,2 +1,196 @@
 # TailServe
-A Developmental PHP server for quickly spinning up site with Tailscale funnel.
+
+Single‑file tool to run a PHP dev server or a browsable directory. Optional exposure via Tailscale Funnel. Built for rapid development and pentesting.
+
+<img width="1333" height="672" alt="image" src="https://github.com/user-attachments/assets/ce80dc81-b146-4c0b-bcb4-d964b0482e30" />
+
+## What it is
+
+* Distributed as a single python script named `tailserve`. Place it in your PATH and run `tailserve`.
+* Wraps PHP’s built‑in server with a hardened router and structured logging.
+* Modes: index (default), spa, api, all404, directory.
+
+## Dependencies
+
+* PHP CLI 8.1+ in PATH
+* Linux/macOS shell
+* Optional: Tailscale installed and logged in for `--funnel`
+
+## Install
+
+```bash
+git clone https://github.com/0xP1ckl3d/TailServe.git
+cd TailServe
+chmod +x tailserve
+sudo mv tailserve /usr/local/bin/
+```
+
+Verify PATH then run:
+
+```bash
+tailserve -h
+```
+
+## Behaviour and defaults
+
+* `tailserve` without flags serves the current directory and tries to host `index.php` if it exists.
+* If `index.php` is absent, `/` returns 404. Files are served by direct path only. No directory listing unless directory mode is enabled.
+
+## Quick starts
+
+Serve current directory as a PHP app (index mode):
+
+```bash
+tailserve
+```
+
+Serve a specific directory and port:
+
+```bash
+tailserve -d /path/to/site -p 3000
+```
+
+Directory mode (browsable UI + upload/download/delete):
+
+```bash
+tailserve -D
+# equivalent to: tailserve -m directory
+```
+
+SPA routing to index.php for non‑file requests:
+
+```bash
+tailserve -m spa -d /path/to/app
+```
+
+API mode (JSON 404 for unknown endpoints):
+
+```bash
+tailserve -m api
+```
+
+Force 404 template for every request:
+
+```bash
+tailserve -m all404
+```
+
+## Authentication
+
+Enable HTTP Basic Auth:
+
+```bash
+tailserve -D -a admin:'P@ssw0rd'
+```
+
+## Tailscale Funnel
+
+Expose the server publicly. Requires `tailscale up` and Funnel enabled on your tailnet.
+
+```bash
+tailserve -p 8000 -f
+```
+
+Stop Funnel:
+
+```bash
+sudo tailscale funnel off
+```
+<img width="1085" height="497" alt="image" src="https://github.com/user-attachments/assets/f15c1f53-b2a3-4555-b2e4-c613fae85b47" />
+
+## Logging
+
+* Colourised structured logs to stderr
+* Optional file logging
+
+```bash
+tailserve -l /var/log/tailserve.log -v
+```
+
+![Router log output](docs/img/placeholder-cli-logs.png)
+
+## Security controls
+
+* Basic auth via `-a USER:PASS`
+* Security headers on by default; disable with `--no-security-headers`
+* `realpath` containment to block traversal
+* Optional per‑IP rate limiting
+
+Examples:
+
+```bash
+# limit to 120 req/min/IP
+tailserve -r 120
+
+# enable CORS to a dev frontend
+tailserve -C --cors-origins http://localhost:5173
+```
+
+## Custom 404 and SPA
+
+Custom 404 template within docroot:
+
+```bash
+tailserve --custom-404 errors/404.html
+```
+
+SPA with CORS allow‑list:
+
+```bash
+tailserve -m spa -C --cors-origins http://localhost:3000
+```
+<img width="1092" height="739" alt="image" src="https://github.com/user-attachments/assets/6046e846-0877-4eb4-8145-2e6695de13bb" />
+
+
+
+## File uploads (directory mode)
+
+* Upload cap: `--max-upload` (default 1G)
+* Read timeout: `--upload-timeout` seconds (default 600)
+
+```bash
+tailserve -D --max-upload 2G --upload-timeout 900
+```
+
+## Health check
+
+`GET /_tailserve/health` returns a minimal JSON body for monitoring.
+
+```text
+{"status":"ok","timestamp":"..."}
+```
+
+## Flags overview
+
+```text
+-p, --port PORT              Port (default 8000)
+-H, --host HOST              Bind address (default 0.0.0.0)
+-d, --directory DIR          Document root (default cwd)
+-i, --index FILE             Index file (default index.php)
+-m, --mode MODE              index | spa | api | all404 | directory
+-D, --serve-directory        Shortcut for directory mode
+-a, --auth USER:PASS         Basic auth
+-C, --cors                   Enable CORS
+    --cors-origins ORIGINS   Comma‑separated allow‑list
+-r, --rate-limit N           Requests per minute per IP
+    --no-security-headers    Disable hardened headers
+    --no-cache-static        Disable static caching
+    --max-upload SIZE        e.g. 200M, 2G
+    --upload-timeout SEC     Max input time
+-l, --log-file PATH          Log to file (no ANSI)
+    --colour MODE            auto | always | never
+-q, --quiet                  Less output
+-v, --verbose                More output
+-c, --config PATH            Load JSON config
+-f, --funnel                 Enable Tailscale Funnel
+```
+
+## Notes
+
+* Use in isolated labs when testing. For production, place behind a real web server.
+* Keep auth and rate limit on when exposing via Funnel where practical.
+* In directory mode, all users can upload, download, and delete files without restriction. If exposing over Funnel, only use with non-sensitive content and always enable strong authentication.
+
+## Licence
+
+MIT.
