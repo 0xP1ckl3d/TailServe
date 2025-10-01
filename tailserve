@@ -1549,6 +1549,8 @@ For more information, visit: https://github.com/0xP1ckl3d/tailserve""",
     # Routing mode
     if config.mode == "directory":
         env["tailserve_MODE"] = "directory"
+    elif config.mode == "proxy":
+        env["tailserve_MODE"] = "proxy"
     elif have_index or config.mode in ['all404', 'api', 'spa']:
         env["tailserve_MODE"] = config.mode
     else:
