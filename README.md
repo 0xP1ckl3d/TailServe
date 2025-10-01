@@ -108,13 +108,14 @@ Proxy mode works well for:
 - Internal tools and services
 
 Proxy mode has limitations with:
+- Conflict with security headers feature, it is recomended to use the `--no-security-headers` feature when using proxy mode
 - Complex JavaScript-heavy sites (Google, Facebook, etc.)
 - Sites with absolute URLs in HTML/CSS/JavaScript
 - WebSocket connections
 - Sites with strict CSP or CORS policies
 
 The proxy automatically:
-- Rewrites `Location` headers for redirects
+- Rewrites `Location` headers for redirects internal redirtects
 - Handles compressed responses (gzip/deflate)
 - Forwards request/response headers
 - Preserves cookies and authentication
