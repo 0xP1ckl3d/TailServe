@@ -171,9 +171,9 @@ tailserve -l app.log -v -P https://api.example.com
 tailserve -l app.log -vv -P https://api.example.com
 ```
 
-Verbose output only goes to the log file, keeping console output clean while providing detailed debugging information for troubleshooting proxy issues, API debugging, or security analysis.
+Verbose output and logging can help in phishing scenarios, where you may wish to proxy a login portal to capture a users credentials.
 
-![Router log output](docs/img/placeholder-cli-logs.png)
+<img width="817" height="127" alt="image" src="https://github.com/user-attachments/assets/806da99c-765f-46df-8c3b-1457de44fe4a" />
 
 ## Security controls
 
